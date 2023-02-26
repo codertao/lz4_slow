@@ -4,7 +4,6 @@
 //! high performance. It has fixed memory usage, which contrary to other approachs, makes it less
 //! memory hungry.
 
-use crate::block::hashtable::HashTable;
 use crate::block::END_OFFSET;
 use crate::block::LZ4_MIN_LENGTH;
 use crate::block::MAX_DISTANCE;
@@ -21,12 +20,7 @@ use alloc::vec::Vec;
 #[cfg(feature = "safe-encode")]
 use core::convert::TryInto;
 
-use super::hashtable::HashTable4KU16;
-use super::hashtable::HashTable8K;
-use super::{CompressError, WINDOW_SIZE};
-
-/// Increase step size after 1<<INCREASE_STEPSIZE_BITSHIFT non matches
-const INCREASE_STEPSIZE_BITSHIFT: usize = 5;
+use super::CompressError;
 
 /// Read a 4-byte "batch" from some position.
 ///
@@ -284,51 +278,82 @@ fn backtrack_match(
     }
 }
 
+#[inline(always)]
+fn find_a_match_simple(input: &[u8], t1: u32, t2: u32, t3: u32, mut best_len: u8) -> Option<(usize, u8)> {
+    if input.len() < 4 { return None }
+    let mut at = input.len()-4;
+    let mut best_match = None;
+    loop {
+        let ex = get_batch(input, at);
+        let len = if ex == t1 {
+            if at < input.len().saturating_sub(12) {
+                let ex = get_batch(input, at+4);
+                if ex == t2 {
+                    let ex = get_batch(input, at+8);
+                    if ex==t3 { 12 } else { 8 }
+                } else { 4 }
+            } else { 4 }
+        } else { 0 };
+        if len > best_len {
+            best_len = len;
+            best_match = Some(at);
+        }
+        if best_len == 12 || at < 4 { break }
+        at-=4;
+    }
+    best_match.map(|m| (m, best_len))
+}
+
+fn find_a_match<const USE_DICT: bool>(
+    input: &[u8],
+    input_pos: usize,
+    ext_dict: &[u8],
+) -> Option<usize> {
+    let act_pos = if USE_DICT { input_pos - ext_dict.len() } else { input_pos };
+    let t1 = get_batch(input, act_pos);
+    let t2 = get_batch(input, act_pos+4);
+    let t3 = get_batch(input, act_pos+8);
+    if USE_DICT {
+        let win_start = input_pos.saturating_sub(MAX_DISTANCE);
+        let main_win = win_start.saturating_sub(ext_dict.len());
+        let main_match = find_a_match_simple(&input[main_win..act_pos+3], t1, t2, t3, 0)
+            .map(|(idx, len)| (idx+main_win+ext_dict.len(), len));
+        let alt_match = if win_start < ext_dict.len() {
+            let c_len = main_match.as_ref().map(|l| l.1).unwrap_or_default();
+            find_a_match_simple(&ext_dict[win_start..], t1, t2, t3, c_len)
+                .map(|(idx, len)| (idx+win_start, len))
+        } else { None };
+        alt_match.or(main_match).map(|(idx, _pos)| idx)
+    } else {
+        let win_start = input_pos.saturating_sub(MAX_DISTANCE);
+        find_a_match_simple(&input[win_start..input_pos+3], t1, t2, t3, 0).map(|(idx,_len)| idx+win_start)
+    }
+}
+
 /// Compress all bytes of `input[input_pos..]` into `output`.
 ///
 /// Bytes in `input[..input_pos]` are treated as a preamble and can be used for lookback.
 /// This part is known as the compressor "prefix".
 /// Bytes in `ext_dict` logically precede the bytes in `input` and can also be used for lookback.
 ///
-/// `input_stream_offset` is the logical position of the first byte of `input`. This allows same
-/// `dict` to be used for many calls to `compress_internal` as we can "readdress" the first byte of
-/// `input` to be something other than 0.
-///
-/// `dict` is the dictionary of previously encoded sequences.
-///
-/// This is used to find duplicates in the stream so they are not written multiple times.
-///
-/// Every four bytes are hashed, and in the resulting slot their position in the input buffer
-/// is placed in the dict. This way we can easily look up a candidate to back references.
-///
 /// Returns the number of bytes written (compressed) into `output`.
 ///
 /// # Const parameters
 /// `USE_DICT`: Disables usage of ext_dict (it'll panic if a non-empty slice is used).
 /// In other words, this generates more optimized code when an external dictionary isn't used.
-///
-/// A similar const argument could be used to disable the Prefix mode (eg. USE_PREFIX),
-/// which would impose `input_pos == 0 && input_stream_offset == 0`. Experiments didn't
-/// show significant improvement though.
 // Intentionally avoid inlining.
 // Empirical tests revealed it to be rarely better but often significantly detrimental.
 #[inline(never)]
-pub(crate) fn compress_internal<T: HashTable, const USE_DICT: bool, S: Sink>(
+pub(crate) fn compress_internal<const USE_DICT: bool, S: Sink>(
     input: &[u8],
     input_pos: usize,
     output: &mut S,
-    dict: &mut T,
     ext_dict: &[u8],
-    input_stream_offset: usize,
 ) -> Result<usize, CompressError> {
     assert!(input_pos <= input.len());
     if USE_DICT {
-        assert!(ext_dict.len() <= super::WINDOW_SIZE);
-        assert!(ext_dict.len() <= input_stream_offset);
         // Check for overflow hazard when using ext_dict
-        assert!(input_stream_offset
-            .checked_add(input.len())
-            .and_then(|i| i.checked_add(ext_dict.len()))
+        assert!(input.len().checked_add(ext_dict.len())
             .map_or(false, |i| i <= isize::MAX as usize));
     } else {
         assert!(ext_dict.is_empty());
@@ -343,97 +368,48 @@ pub(crate) fn compress_internal<T: HashTable, const USE_DICT: bool, S: Sink>(
         return Ok(output.pos() - output_start_pos);
     }
 
-    let ext_dict_stream_offset = input_stream_offset - ext_dict.len();
     let end_pos_check = input.len() - MFLIMIT;
     let mut literal_start = input_pos;
     let mut cur = input_pos;
 
-    if cur == 0 && input_stream_offset == 0 {
+    if cur == 0 && ext_dict.len() == 0 {
         // According to the spec we can't start with a match,
         // except when referencing another block.
-        let hash = T::get_hash_at(input, 0);
-        dict.put_at(hash, 0);
         cur = 1;
     }
 
     loop {
         // Read the next block into two sections, the literals and the duplicates.
-        let mut step_size;
         let mut candidate;
-        let mut candidate_source;
-        let mut offset;
-        let mut non_match_count = 1 << INCREASE_STEPSIZE_BITSHIFT;
-        // The number of bytes before our cursor, where the duplicate starts.
-        let mut next_cur = cur;
+        let candidate_source;
+        let offset;
 
-        // In this loop we search for duplicates via the hashtable. 4bytes or 8bytes are hashed and
-        // compared.
+        //search for duplicates, slowly and suboptimally
         loop {
-            step_size = non_match_count >> INCREASE_STEPSIZE_BITSHIFT;
-            non_match_count += 1;
-
-            cur = next_cur;
-            next_cur += step_size;
-
             // Same as cur + MFLIMIT > input.len()
             if cur > end_pos_check {
                 handle_last_literals(output, input, literal_start);
                 return Ok(output.pos() - output_start_pos);
             }
-            // Find a candidate in the dictionary with the hash of the current four bytes.
-            // Unchecked is safe as long as the values from the hash function don't exceed the size
-            // of the table. This is ensured by right shifting the hash values
-            // (`dict_bitshift`) to fit them in the table
 
-            // [Bounds Check]: Can be elided due to `end_pos_check` above
-            let hash = T::get_hash_at(input, cur);
-            candidate = dict.get_at(hash);
-            dict.put_at(hash, cur + input_stream_offset);
-
-            // Sanity check: Matches can't be ahead of `cur`.
-            debug_assert!(candidate <= input_stream_offset + cur);
-
-            // Two requirements to the candidate exists:
-            // - We should not return a position which is merely a hash collision, so that the
-            //   candidate actually matches what we search for.
-            // - We can address up to 16-bit offset, hence we are only able to address the candidate
-            //   if its offset is less than or equals to 0xFFFF.
-            if input_stream_offset + cur - candidate > MAX_DISTANCE {
-                continue;
-            }
-
-            if candidate >= input_stream_offset {
-                // match within input
-                offset = (input_stream_offset + cur - candidate) as u16;
-                candidate -= input_stream_offset;
-                candidate_source = input;
-            } else if USE_DICT {
-                // Sanity check, which may fail if we lost history beyond MAX_DISTANCE
-                debug_assert!(
-                    candidate >= ext_dict_stream_offset,
-                    "Lost history in ext dict mode"
-                );
-                // match within ext dict
-                offset = (input_stream_offset + cur - candidate) as u16;
-                candidate -= ext_dict_stream_offset;
-                candidate_source = ext_dict;
-            } else {
-                // Match is not reachable anymore
-                // eg. compressing an independent block frame w/o clearing
-                // the matches tables, only increasing input_stream_offset.
-                // Sanity check
-                debug_assert!(input_pos == 0, "Lost history in prefix mode");
-                continue;
-            }
-            // [Bounds Check]: Candidate is coming from the Hashmap. It can't be out of bounds, but
-            // impossible to prove for the compiler and remove the bounds checks.
-            let cand_bytes: u32 = get_batch(candidate_source, candidate);
-            // [Bounds Check]: Should be able to be elided due to `end_pos_check`.
-            let curr_bytes: u32 = get_batch(input, cur);
-
-            if cand_bytes == curr_bytes {
+            let rel_pos = if USE_DICT { cur+ext_dict.len() } else { cur };
+            if let Some(idx) = find_a_match::<USE_DICT>(input, rel_pos, ext_dict) {
+                offset = (rel_pos-idx) as u16;
+                if USE_DICT {
+                    if idx < ext_dict.len() {
+                        candidate_source = ext_dict;
+                        candidate = idx;
+                    } else {
+                        candidate_source = input;
+                        candidate = idx - ext_dict.len();
+                    }
+                } else {
+                    candidate_source = input;
+                    candidate = idx;
+                }
                 break;
             }
+            cur += 1; // if cur-literal_start > 32 { 3 } else { 1 };
         }
 
         // Extend the match backwards if we can
@@ -452,11 +428,6 @@ pub(crate) fn compress_internal<T: HashTable, const USE_DICT: bool, S: Sink>(
         cur += MINMATCH;
         candidate += MINMATCH;
         let duplicate_length = count_same_bytes(input, &mut cur, candidate_source, candidate);
-
-        // Note: The `- 2` offset was copied from the reference implementation, it could be
-        // arbitrary.
-        let hash = T::get_hash_at(input, cur - 2);
-        dict.put_at(hash, cur - 2 + input_stream_offset);
 
         let token = token_from_literal_and_match_length(lit_len, duplicate_length);
 
@@ -567,40 +538,20 @@ fn copy_literals_wild(output: &mut impl Sink, input: &[u8], input_start: usize, 
 pub(crate) fn compress_into_sink_with_dict<const USE_DICT: bool>(
     input: &[u8],
     output: &mut impl Sink,
-    mut dict_data: &[u8],
+    dict_data: &[u8],
 ) -> Result<usize, CompressError> {
-    if dict_data.len() + input.len() < u16::MAX as usize {
-        let mut dict = HashTable4KU16::new();
-        init_dict(&mut dict, &mut dict_data);
-        compress_internal::<_, USE_DICT, _>(input, 0, output, &mut dict, dict_data, dict_data.len())
-    } else {
-        // For some reason using a 4K hashtable causes a performance regression (memory layout?)
-        let mut dict = HashTable8K::new();
-        init_dict(&mut dict, &mut dict_data);
-        compress_internal::<_, USE_DICT, _>(input, 0, output, &mut dict, dict_data, dict_data.len())
-    }
-}
-
-#[inline]
-fn init_dict<T: HashTable>(dict: &mut T, dict_data: &mut &[u8]) {
-    if dict_data.len() > WINDOW_SIZE {
-        *dict_data = &dict_data[dict_data.len() - WINDOW_SIZE..];
-    }
-    let mut i = 0usize;
-    while i + core::mem::size_of::<usize>() <= dict_data.len() {
-        let hash = T::get_hash_at(dict_data, i);
-        dict.put_at(hash, i);
-        // Note: The 3 byte step was copied from the reference implementation, it could be
-        // arbitrary.
-        i += 3;
-    }
+    compress_internal::<USE_DICT, _>(input, 0, output,  dict_data)
 }
 
 /// Returns the maximum output size of the compressed data.
 /// Can be used to preallocate capacity on the output vector
 #[inline]
 pub fn get_maximum_output_size(input_len: usize) -> usize {
-    16 + 4 + (input_len as f64 * 1.1) as usize
+    let factor = match input_len.checked_mul(11) {
+        Some(i) => i/10,
+        None => (input_len / 10)*11
+    };
+    16 + 4 + factor
 }
 
 /// Compress all bytes of `input` into `output`.
@@ -912,5 +863,61 @@ mod tests {
         let decompressed =
             crate::block::decompress_size_prepended_with_dict(&compressed, &dict).unwrap();
         assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_all_the_stuff() {
+        let mut data = [0u8; 16*1024];
+        let mut comp = [0u8; 32*1024];
+        let mut out = [0u8; 32*1024];
+
+        let mut at = 0;
+        let mut p1 = 0u8;
+        let mut p2 = 0u8;
+        let mut p3 = 0u8;
+        while at < data.len() {
+            data[at] = p1;
+            at+=1;
+            p2 += 1;
+            if p2 > p3 {
+                p1 = if p1 > 3 { 0 } else { p1+1 };
+                p2 = 0;
+                p3 += 1;
+                if p3 == 13 { p3=200;}
+                if p3 > 220 { p3 = 4; }
+            }
+        }
+
+        let mut sz_comp_old = 0;
+        let mut sz_comp = 0;
+        let mut sz_full = 0;
+
+        for sp in 4..data.len() {
+            let input = &data[sp..];
+            let dict = &data[..sp];
+            let old_sz = crate::block::compress_into_with_dict(input, &mut comp[..], dict).expect("Old compress failed?");
+            let sz = compress_into_with_dict(input, &mut comp[..], dict).expect("Oi? Comp Fail");
+            sz_comp += sz;
+            sz_comp_old += old_sz;
+            let sz2 = crate::block::decompress_into_with_dict(&comp[..sz], &mut out[..], dict).expect("Decomp Fail");
+            sz_full += sz2;
+            assert_eq!(input, &out[..sz2]);
+        }
+
+        for sp in 4..data.len() {
+            let input = &data[sp..(sp+(sp%300)).min(data.len())];
+            let dict = &data[..sp];
+            let old_sz = crate::block::compress_into_with_dict(input, &mut comp[..], dict).expect("Old compress failed?");
+            let sz = compress_into_with_dict(input, &mut comp[..], dict).expect("Oi? Comp Fail");
+            sz_comp += sz;
+            sz_comp_old += old_sz;
+            let sz2 = crate::block::decompress_into_with_dict(&comp[..sz], &mut out[..], dict).expect("Decomp Fail");
+            sz_full += sz2;
+            assert_eq!(input, &out[..sz2]);
+        }
+
+        println!("Old Compression: {}", sz_comp_old);
+        println!("New Compression: {}", sz_comp);
+        println!("Raw Data: {}", sz_full);
     }
 }

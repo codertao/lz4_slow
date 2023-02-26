@@ -31,6 +31,14 @@ pub(crate) mod decompress;
 
 pub use compress::*;
 pub use decompress::*;
+pub use compress_slow::{
+    compress_prepend_size_with_dict as slow_compress_prepend_size_with_dict,
+    compress_with_dict as slow_compress_with_dict,
+    compress as slow_compress,
+    compress_prepend_size as slow_compress_prepend_size,
+    compress_into_with_dict as slow_compress_into_with_dict,
+    compress_into as slow_compress_into,
+};
 
 use core::convert::TryInto;
 use core::fmt;
