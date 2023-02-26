@@ -16,6 +16,8 @@
 
 #[cfg_attr(feature = "safe-encode", forbid(unsafe_code))]
 pub(crate) mod compress;
+#[cfg_attr(feature = "safe-encode", forbid(unsafe_code))]
+pub(crate) mod compress_slow;
 pub(crate) mod hashtable;
 
 #[cfg(feature = "safe-decode")]
